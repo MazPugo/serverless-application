@@ -1,8 +1,23 @@
+// --- Module-scope initialization (runs once per cold start, reused warm) ---
+// Import only the specific clients/commands needed to keep the module graph
+// minimal. On the nodejs managed runtime the AWS SDK v3 is provided by Lambda,
+// so it is NOT bundled into the deployment package.
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
 
-const client = new DynamoDBClient({});
-const docClient = DynamoDBDocumentClient.from(client);
+// Reuse TCP connections across invocations for lower per-call latency.
+// (Also controllable via the AWS_NODEJS_CONNECTION_REUSE_ENABLED env var.)
+const client = new DynamoDBClient({
+  maxAttempts: 3,
+});
+
+// Marshalling options defined once at init, not per request.
+const docClient = DynamoDBDocumentClient.from(client, {
+  marshallOptions: {
+    removeUndefinedValues: true,
+    convertClassInstanceToMap: true,
+  },
+});
 
 const TABLE_NAME = process.env.ORDERS_TABLE_NAME;
 

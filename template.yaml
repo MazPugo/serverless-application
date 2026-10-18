@@ -1,8 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Serverless application resources - DynamoDB "Orders" table and a
+  Serverless application resources - DynamoDB "Orders" global table and a
   Node.js Lambda function to save orders.
+
+Parameters:
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    Description: Secondary AWS region for the DynamoDB global table replica (disaster recovery).
 
 Globals:
   Function:
@@ -47,14 +53,99 @@ Resources:
       Name: OrdersApi
       StageName: prod
       Description: REST API for the Orders serverless application
+      # Stage-level caching to reduce latency (TTL 300s). A cache cluster must
+      # be enabled on the stage, then caching is turned on per method.
+      CacheClusterEnabled: true
+      CacheClusterSize: "0.5"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          CachingEnabled: true
+          CacheTtlInSeconds: 300
       Auth:
         DefaultAuthorizer: CognitoAuthorizer
         Authorizers:
           CognitoAuthorizer:
             UserPoolArn: !GetAtt OrdersUserPool.Arn
+      # GET /orders/{orderId} is defined here as a direct AWS service
+      # integration to DynamoDB (no Lambda). Defining it in the API's
+      # OpenAPI DefinitionBody keeps it in the same deployment SAM manages,
+      # avoiding drift/orphaned-resource issues. SAM merges the Lambda
+      # function's POST /orders event into this definition automatically.
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+          title: OrdersApi
+        paths:
+          /orders/{orderId}:
+            get:
+              parameters:
+                - name: orderId
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                "200":
+                  description: Order items
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/Query"
+                credentials: !GetAtt GetOrderApiRole.Arn
+                passthroughBehavior: when_no_templates
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "TableName": "${OrdersTable}",
+                      "KeyConditionExpression": "orderId = :orderId",
+                      "ExpressionAttributeValues": {
+                        ":orderId": { "S": "$util.escapeJavaScript($input.params('orderId'))" }
+                      }
+                    }
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: |
+                        #set($items = $input.path('$.Items'))
+                        {
+                          "orderId": "$util.escapeJavaScript($input.params('orderId'))",
+                          "count": $input.path('$.Count'),
+                          "items": [
+                            #foreach($item in $items)
+                            {
+                              "orderId": "$item.orderId.S",
+                              "itemId": "$item.itemId.S"
+                              #if($item.quantity.N),"quantity": $item.quantity.N#end
+                              #if($item.product.S),"product": "$util.escapeJavaScript($item.product.S)"#end
+                              #if($item.createdAt.S),"createdAt": "$item.createdAt.S"#end
+                            }#if($foreach.hasNext),#end
+                            #end
+                          ]
+                        }
+                  "5\\d{2}":
+                    statusCode: "500"
+                    responseTemplates:
+                      application/json: |
+                        { "message": "Failed to retrieve order." }
 
+  # DynamoDB Global Table (multi-region). Streams are REQUIRED for global
+  # tables and are enabled with NEW_AND_OLD_IMAGES. One replica lives in the
+  # primary (stack) region and one in the secondary region for DR.
+  #
+  # NOTE: This is the AWS::DynamoDB::GlobalTable resource type, which is a
+  # DIFFERENT resource type from the previous AWS::DynamoDB::Table. Deploying
+  # this change against a stack that already has an AWS::DynamoDB::Table named
+  # "Orders" will attempt to REPLACE (delete + recreate) the table and lose
+  # data. See the migration note in the task summary before deploying.
   OrdersTable:
-    Type: AWS::DynamoDB::Table
+    Type: AWS::DynamoDB::GlobalTable
+    # Protect against accidental deletion of the replicated data.
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
     Properties:
       TableName: Orders
       BillingMode: PAY_PER_REQUEST
@@ -68,6 +159,24 @@ Resources:
           KeyType: HASH
         - AttributeName: itemId
           KeyType: RANGE
+      # Streams are mandatory for global tables.
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Replicas:
+        # Primary replica - must be the region the stack is deployed to.
+        - Region: !Ref AWS::Region
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - Key: Role
+              Value: primary
+        # Secondary replica - disaster-recovery / multi-region availability.
+        - Region: !Ref SecondaryRegion
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - Key: Role
+              Value: secondary
 
   SaveOrderFunction:
     Type: AWS::Serverless::Function
@@ -79,6 +188,7 @@ Resources:
       Environment:
         Variables:
           ORDERS_TABLE_NAME: !Ref OrdersTable
+          AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1"
       Policies:
         - DynamoDBWritePolicy:
             TableName: !Ref OrdersTable
@@ -89,6 +199,225 @@ Resources:
             RestApiId: !Ref OrdersApi
             Path: /orders
             Method: post
+
+  # --- DAX-backed read function (VPC-attached; reads via amazon-dax-client) ---
+  GetOrderViaDaxFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: GetOrderViaDax
+      Description: Reads orders from DynamoDB via the DAX cache
+      CodeUri: src/get-order-dax/
+      Handler: index.handler
+      # VPC-attached so it can reach the DAX cluster.
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref OrdersDaxSecurityGroup
+        SubnetIds:
+          - !Ref OrdersSubnetA
+          - !Ref OrdersSubnetB
+      Environment:
+        Variables:
+          ORDERS_TABLE_NAME: !Ref OrdersTable
+          # DAX cluster cluster-discovery endpoint (host:port).
+          DAX_ENDPOINT: !GetAtt OrdersDaxCluster.ClusterDiscoveryEndpointURL
+          AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1"
+      Policies:
+        # Read access to the table (DAX proxies to it); plus the DAX data-plane
+        # permissions the client needs to talk to the cluster.
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dax:GetItem
+                - dax:BatchGetItem
+                - dax:Query
+                - dax:Scan
+              Resource: !GetAtt OrdersDaxCluster.Arn
+      Events:
+        GetOrderDax:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrdersApi
+            Path: /dax-orders/{orderId}
+            Method: get
+
+  # --- IAM role API Gateway assumes to call DynamoDB directly (no Lambda) ---
+  GetOrderApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GetOrderApiGatewayDynamoDBRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QueryOrdersTable
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt OrdersTable.Arn
+
+  # ======================================================================
+  # VPC networking (required by DAX). DAX runs inside a VPC and is only
+  # reachable from in-VPC compute, so the Lambda read path is VPC-attached.
+  # ======================================================================
+  OrdersVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: orders-vpc
+
+  OrdersSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref OrdersVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: orders-subnet-a
+
+  OrdersSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref OrdersVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: orders-subnet-b
+
+  # Route table for the private subnets (used by the DynamoDB gateway endpoint).
+  OrdersRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref OrdersVpc
+      Tags:
+        - Key: Name
+          Value: orders-rtb
+
+  OrdersSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref OrdersSubnetA
+      RouteTableId: !Ref OrdersRouteTable
+
+  OrdersSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref OrdersSubnetB
+      RouteTableId: !Ref OrdersRouteTable
+
+  # Security group shared by the Lambda and DAX. The self-referencing ingress
+  # rule allows the Lambda ENIs to reach the DAX cluster on its ports.
+  OrdersDaxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for DAX cluster and VPC-attached Lambda
+      VpcId: !Ref OrdersVpc
+      Tags:
+        - Key: Name
+          Value: orders-dax-sg
+
+  OrdersDaxSgSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref OrdersDaxSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8111
+      ToPort: 9111
+      SourceSecurityGroupId: !Ref OrdersDaxSecurityGroup
+
+  # Gateway VPC endpoint so the VPC-attached Lambda can still reach DynamoDB
+  # (for writes / DAX write-through) without a NAT gateway.
+  DynamoDbVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref OrdersVpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref OrdersRouteTable
+
+  # ======================================================================
+  # DynamoDB Accelerator (DAX) - in-memory cache in front of the table.
+  # ======================================================================
+  # Role DAX assumes to read/write the underlying Orders table.
+  OrdersDaxRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: OrdersDaxServiceRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dax.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DaxAccessOrdersTable
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:ConditionCheckItem
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !Sub "${OrdersTable.Arn}/index/*"
+
+  OrdersDaxSubnetGroup:
+    Type: AWS::DAX::SubnetGroup
+    Properties:
+      SubnetGroupName: orders-dax-subnet-group
+      Description: Subnets for the Orders DAX cluster
+      SubnetIds:
+        - !Ref OrdersSubnetA
+        - !Ref OrdersSubnetB
+
+  OrdersDaxParameterGroup:
+    Type: AWS::DAX::ParameterGroup
+    Properties:
+      ParameterGroupName: orders-dax-param-group
+      Description: Parameter group for the Orders DAX cluster
+      ParameterNameValues:
+        # 5 minutes item TTL, matching the API cache TTL for consistency.
+        "query-ttl-millis": "300000"
+        "record-ttl-millis": "300000"
+
+  OrdersDaxCluster:
+    Type: AWS::DAX::Cluster
+    Properties:
+      ClusterName: orders-dax
+      Description: DAX cluster accelerating reads of the Orders table
+      IAMRoleARN: !GetAtt OrdersDaxRole.Arn
+      NodeType: dax.t3.small
+      ReplicationFactor: 1
+      SubnetGroupName: !Ref OrdersDaxSubnetGroup
+      ParameterGroupName: !Ref OrdersDaxParameterGroup
+      SecurityGroupIds:
+        - !Ref OrdersDaxSecurityGroup
+      SSESpecification:
+        SSEEnabled: true
 
   OrdersApiWebAcl:
     Type: AWS::WAFv2::WebACL
@@ -194,8 +523,14 @@ Outputs:
     Description: Name of the Orders DynamoDB table
     Value: !Ref OrdersTable
   OrdersTableArn:
-    Description: ARN of the Orders DynamoDB table
+    Description: ARN of the Orders DynamoDB table (primary region)
     Value: !GetAtt OrdersTable.Arn
+  OrdersTableStreamArn:
+    Description: DynamoDB stream ARN of the Orders global table
+    Value: !GetAtt OrdersTable.StreamArn
+  OrdersTableSecondaryRegion:
+    Description: Secondary region hosting the global table replica
+    Value: !Ref SecondaryRegion
   SaveOrderFunctionName:
     Description: Name of the SaveOrder Lambda function
     Value: !Ref SaveOrderFunction
@@ -205,6 +540,18 @@ Outputs:
   CreateOrderApiUrl:
     Description: Invoke URL for POST /orders
     Value: !Sub "https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/prod/orders"
+  GetOrderApiUrl:
+    Description: Invoke URL template for GET /orders/{orderId} (direct DynamoDB integration)
+    Value: !Sub "https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/prod/orders/{orderId}"
+  GetOrderViaDaxUrl:
+    Description: Invoke URL template for GET /dax-orders/{orderId} (Lambda via DAX)
+    Value: !Sub "https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/prod/dax-orders/{orderId}"
+  DaxClusterEndpoint:
+    Description: DAX cluster discovery endpoint
+    Value: !GetAtt OrdersDaxCluster.ClusterDiscoveryEndpointURL
+  DaxClusterArn:
+    Description: ARN of the DAX cluster
+    Value: !GetAtt OrdersDaxCluster.Arn
   UserPoolId:
     Description: Cognito User Pool ID
     Value: !Ref OrdersUserPool

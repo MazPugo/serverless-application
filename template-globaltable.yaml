@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless application resources - DynamoDB "Orders" global table and a
+  Node.js Lambda function to save orders. (DAX/VPC omitted in this deploy copy.)
+
+Parameters:
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    Description: Secondary AWS region for the DynamoDB global table replica (disaster recovery).
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 128
+    Runtime: nodejs24.x
+    Tracing: Active
+  Api:
+    TracingEnabled: true
+
+Resources:
+  OrdersUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: OrdersUserPool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  OrdersUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: OrdersUserPoolClient
+      UserPoolId: !Ref OrdersUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  OrdersApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: OrdersApi
+      StageName: prod
+      Description: REST API for the Orders serverless application
+      # Stage-level caching to reduce latency (TTL 300s).
+      CacheClusterEnabled: true
+      CacheClusterSize: "0.5"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          CachingEnabled: true
+          CacheTtlInSeconds: 300
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt OrdersUserPool.Arn
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+          title: OrdersApi
+        paths:
+          /orders/{orderId}:
+            get:
+              parameters:
+                - name: orderId
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                "200":
+                  description: Order items
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/Query"
+                credentials: !GetAtt GetOrderApiRole.Arn
+                passthroughBehavior: when_no_templates
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "TableName": "${OrdersTable}",
+                      "KeyConditionExpression": "orderId = :orderId",
+                      "ExpressionAttributeValues": {
+                        ":orderId": { "S": "$util.escapeJavaScript($input.params('orderId'))" }
+                      }
+                    }
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: |
+                        #set($items = $input.path('$.Items'))
+                        {
+                          "orderId": "$util.escapeJavaScript($input.params('orderId'))",
+                          "count": $input.path('$.Count'),
+                          "items": [
+                            #foreach($item in $items)
+                            {
+                              "orderId": "$item.orderId.S",
+                              "itemId": "$item.itemId.S"
+                              #if($item.quantity.N),"quantity": $item.quantity.N#end
+                              #if($item.product.S),"product": "$util.escapeJavaScript($item.product.S)"#end
+                              #if($item.createdAt.S),"createdAt": "$item.createdAt.S"#end
+                            }#if($foreach.hasNext),#end
+                            #end
+                          ]
+                        }
+                  "5\\d{2}":
+                    statusCode: "500"
+                    responseTemplates:
+                      application/json: |
+                        { "message": "Failed to retrieve order." }
+
+  # DynamoDB Global Table (multi-region). Streams REQUIRED and enabled with
+  # NEW_AND_OLD_IMAGES. Primary replica in the stack region + a secondary
+  # replica in SecondaryRegion for disaster recovery / multi-region availability.
+  OrdersTable:
+    Type: AWS::DynamoDB::GlobalTable
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      TableName: Orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: itemId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+        - AttributeName: itemId
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Replicas:
+        - Region: !Ref AWS::Region
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - Key: Role
+              Value: primary
+        - Region: !Ref SecondaryRegion
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          Tags:
+            - Key: Role
+              Value: secondary
+
+  SaveOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SaveOrder
+      Description: Saves an order item to the Orders DynamoDB table
+      CodeUri: src/save-order/
+      Handler: index.handler
+      Environment:
+        Variables:
+          ORDERS_TABLE_NAME: !Ref OrdersTable
+          AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1"
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref OrdersTable
+      Events:
+        CreateOrder:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrdersApi
+            Path: /orders
+            Method: post
+
+  # IAM role API Gateway assumes to call DynamoDB directly (no Lambda).
+  GetOrderApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GetOrderApiGatewayDynamoDBRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QueryOrdersTable
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt OrdersTable.Arn
+
+  OrdersApiWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: OrdersApiWebAcl
+      Scope: REGIONAL
+      Description: Rate-based protection for the Orders API
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: OrdersApiWebAcl
+      Rules:
+        - Name: RateLimitPerIp
+          Priority: 0
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 1000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIp
+
+  OrdersApiWebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: OrdersApiprodStage
+    Properties:
+      ResourceArn: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${OrdersApi}/stages/prod"
+      WebACLArn: !GetAtt OrdersApiWebAcl.Arn
+
+  OrdersDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: OrdersApplicationDashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API Gateway - Request Count",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "OrdersApi", "Stage", "prod" ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API Gateway - 4XX Errors",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/ApiGateway", "4XXError", "ApiName", "OrdersApi", "Stage", "prod" ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda - Invocations",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "SaveOrder" ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda - Errors",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/Lambda", "Errors", "FunctionName", "SaveOrder" ]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  OrdersTableName:
+    Description: Name of the Orders DynamoDB table
+    Value: !Ref OrdersTable
+  OrdersTableArn:
+    Description: ARN of the Orders DynamoDB table (primary region)
+    Value: !GetAtt OrdersTable.Arn
+  OrdersTableStreamArn:
+    Description: DynamoDB stream ARN of the Orders global table
+    Value: !GetAtt OrdersTable.StreamArn
+  OrdersTableSecondaryRegion:
+    Description: Secondary region hosting the global table replica
+    Value: !Ref SecondaryRegion
+  SaveOrderFunctionName:
+    Description: Name of the SaveOrder Lambda function
+    Value: !Ref SaveOrderFunction
+  CreateOrderApiUrl:
+    Description: Invoke URL for POST /orders
+    Value: !Sub "https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/prod/orders"
+  GetOrderApiUrl:
+    Description: Invoke URL template for GET /orders/{orderId} (direct DynamoDB integration)
+    Value: !Sub "https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/prod/orders/{orderId}"
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref OrdersUserPool
+  UserPoolClientId:
+    Description: Cognito User Pool App Client ID
+    Value: !Ref OrdersUserPoolClient
+  WebAclArn:
+    Description: ARN of the WAF WebACL protecting the API
+    Value: !GetAtt OrdersApiWebAcl.Arn
+  DashboardUrl:
+    Description: URL of the CloudWatch dashboard
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=OrdersApplicationDashboard"

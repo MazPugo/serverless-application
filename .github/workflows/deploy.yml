@@ -13,6 +13,12 @@ concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
 
+# Required for GitHub OIDC: the runner needs to mint an OIDC token that AWS
+# exchanges for short-lived credentials. No long-lived access keys are stored.
+permissions:
+  id-token: write
+  contents: read
+
 env:
   AWS_REGION: us-east-1
   STACK_NAME: serverless-application

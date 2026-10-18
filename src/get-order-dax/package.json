@@ -1,0 +1,10 @@
+{
+  "name": "get-order-dax",
+  "version": "1.0.0",
+  "description": "Lambda that reads orders from DynamoDB via DAX",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "amazon-dax-client": "^1.2.9"
+  }
+}
