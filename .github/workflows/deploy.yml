@@ -53,7 +53,7 @@ jobs:
         with:
           # ARN of the IAM role that trusts GitHub's OIDC provider.
           # Stored as a repo secret so it is not hardcoded. No access keys.
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           role-session-name: github-actions-sam-deploy
           aws-region: ${{ env.AWS_REGION }}
 
