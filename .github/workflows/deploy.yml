@@ -1,76 +1,56 @@
 name: Deploy Serverless Application
 
-# Deploys the SAM application (template + Lambda code) on every push to main.
 on:
   push:
     branches:
       - main
-  # Allow manual runs from the Actions tab as well.
-  workflow_dispatch:
 
-# Avoid overlapping deployments if multiple pushes land quickly.
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
-
-# Required for GitHub OIDC: the runner needs to mint an OIDC token that AWS
-# exchanges for short-lived credentials. No long-lived access keys are stored.
+# Permissions block is REQUIRED to request the OIDC JWT token
 permissions:
   id-token: write
   contents: read
 
-env:
-  AWS_REGION: us-east-1
-  STACK_NAME: serverless-application
-  SAM_CLI_TELEMETRY: 0
-
 jobs:
   deploy:
-    name: Build and deploy with SAM
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout repository code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Set up Node.js runtime
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-
-      - name: Set up Python (required by AWS SAM CLI)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+          node-version: '20'
 
       - name: Install AWS SAM CLI
         uses: aws-actions/setup-sam@v2
         with:
           use-installer: true
 
-      - name: Configure AWS credentials (OIDC)
+      # Authenticate securely using OIDC role assumption (no stored keys).
+      # audience defaults to sts.amazonaws.com, which the role's trust policy
+      # expects - do NOT set a malformed value here.
+      - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          # ARN of the IAM role that trusts GitHub's OIDC provider.
-          # Stored as a repo secret so it is not hardcoded. No access keys.
+          aws-region: us-east-1
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           role-session-name: github-actions-sam-deploy
-          aws-region: ${{ env.AWS_REGION }}
 
       - name: Verify AWS identity
         run: aws sts get-caller-identity
 
-      - name: Validate SAM template
-        run: sam validate --lint
-
-      - name: SAM build (packages Lambda function code)
+      - name: Build application resources
         run: sam build
 
-      - name: SAM deploy (updates stack and Lambda code)
+      # Stack name, capabilities and artifact bucket must be passed explicitly
+      # (no samconfig.toml is committed). The templates create named IAM roles,
+      # so CAPABILITY_NAMED_IAM is required.
+      - name: Deploy application stack
         run: >
           sam deploy
-          --stack-name "$STACK_NAME"
-          --region "$AWS_REGION"
+          --stack-name serverless-application
+          --region us-east-1
           --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
           --resolve-s3
           --no-confirm-changeset
