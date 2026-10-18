@@ -262,16 +262,53 @@ The item should appear in `us-west-2` within a few seconds.
 
 ---
 
-## 10. CI/CD with GitHub Actions
+## 10. CI/CD with GitHub Actions (OIDC)
 
-`.github/workflows/deploy.yml` builds and deploys on every push to `main`.
+`.github/workflows/deploy.yml` builds and deploys on every push to `main`. It
+authenticates to AWS using **GitHub OIDC** — short-lived credentials from an
+assumed IAM role, with **no long-lived access keys stored** in the repo. The
+workflow builds and deploys `template-globaltable.yaml` (the DAX-free version).
 
-**Setup:**
+### How OIDC auth works here
 
-1. Add two repository secrets (Settings → Secrets and variables → Actions):
-   - `AWS_ACCESS_KEY_ID`
-   - `AWS_SECRET_ACCESS_KEY`
-2. Push to `main`:
+1. GitHub mints a short-lived JWT for the run (identified by a `sub` claim like
+   `repo:<owner>/<repo>:ref:refs/heads/main`).
+2. The `configure-aws-credentials` action sends it to AWS STS and requests the
+   deploy role.
+3. AWS checks the role's **trust policy** — if the token's `sub` and `aud` match
+   the allowed conditions, STS returns temporary credentials.
+
+### One-time AWS setup
+
+1. **OIDC identity provider** for `token.actions.githubusercontent.com` with
+   audience `sts.amazonaws.com`. (Create once per account; may already exist.)
+2. **IAM role** (e.g. `github-actions-sam-deploy`) with:
+   - A **trust policy** scoped to this repo + branch. Example (exact `sub`):
+     ```json
+     {
+       "Effect": "Allow",
+       "Principal": { "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com" },
+       "Action": "sts:AssumeRoleWithWebIdentity",
+       "Condition": {
+         "StringEquals": {
+           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+           "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:ref:refs/heads/main"
+         }
+       }
+     }
+     ```
+   - **Permissions** to deploy the stack (CloudFormation, DynamoDB, Lambda,
+     API Gateway, Cognito, WAFv2, CloudWatch, Logs, X-Ray, S3, EC2, DAX, and
+     scoped IAM role management).
+
+### GitHub setup
+
+Add one repository secret (Settings → Secrets and variables → Actions):
+
+- **`AWS_ROLE_TO_ASSUME`** = the role ARN, e.g.
+  `arn:aws:iam::<ACCOUNT_ID>:role/github-actions-sam-deploy`
+
+Then push to `main`:
 
 ```powershell
 git add .
@@ -279,9 +316,43 @@ git commit -m "Deploy orders app"
 git push
 ```
 
-The workflow runs `sam validate`, `sam build`, then `sam deploy` against `serverless-application` in `us-east-1`. (It uses the default template; point it at `template-globaltable.yaml` if you want the DAX-free version in CI.)
+The workflow's **Verify AWS identity** step runs `aws sts get-caller-identity`
+and should print the assumed role ARN, confirming OIDC worked before SAM runs.
 
-> For stronger security, consider switching from stored access keys to GitHub OIDC with an assumed IAM role.
+### Troubleshooting OIDC
+
+**`Could not load credentials from any providers`** — the role ARN secret is
+missing/empty, or the workflow still references access-key inputs. Confirm
+`AWS_ROLE_TO_ASSUME` is set and the step uses `role-to-assume:` (not
+`aws-access-key-id`).
+
+**`Not authorized to perform sts:AssumeRoleWithWebIdentity`** — the OIDC handshake
+worked but the role's trust policy rejected the token. Common causes:
+
+1. **Secret points at the wrong role** (e.g. another project's role whose trust
+   policy only allows a different repo). Point it at this repo's role.
+2. **`sub` format mismatch.** If the account uses immutable/unique IDs in OIDC
+   subjects, the `sub` looks like
+   `repo:<owner>@<ownerId>/<repo>@<repoId>:ref:refs/heads/main` — the extra
+   `@<id>` segments won't match a plain `repo:<owner>/<repo>:*` pattern. Match
+   the real value.
+3. **Bad `audience`.** Leave it default (`sts.amazonaws.com`); do not set a
+   malformed value.
+
+To see the **exact** `sub`/`aud` the failing run sent, check CloudTrail:
+
+```powershell
+aws cloudtrail lookup-events `
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity `
+  --region us-east-1 --max-results 1 --query "Events[].CloudTrailEvent"
+```
+
+The `userName`/`principalId` in the event is the `sub` claim — update the trust
+policy to match it.
+
+> **Switching CI to deploy DAX too:** the workflow builds
+> `template-globaltable.yaml`. To deploy the full stack with DAX/VPC, change the
+> `sam build -t ...` step to use `template.yaml` (slower, extra cost).
 
 ---
 

@@ -40,12 +40,16 @@ jobs:
       - name: Verify AWS identity
         run: aws sts get-caller-identity
 
+      # Build the DAX-free template (template-globaltable.yaml). This is the
+      # version that is actually deployed - it avoids provisioning the DAX
+      # cluster + VPC in template.yaml. To deploy DAX too, change -t below.
       - name: Build application resources
-        run: sam build
+        run: sam build -t template-globaltable.yaml
 
       # Stack name, capabilities and artifact bucket must be passed explicitly
       # (no samconfig.toml is committed). The templates create named IAM roles,
-      # so CAPABILITY_NAMED_IAM is required.
+      # so CAPABILITY_NAMED_IAM is required. sam deploy uses the built template
+      # in .aws-sam/build produced by the step above.
       - name: Deploy application stack
         run: >
           sam deploy
