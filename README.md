@@ -69,9 +69,8 @@ This Readme is written as a **step-by-step guide**. Follow it top to bottom to u
 
 ```
 serverless-application/
-├─ template.yaml               # Full template: global table + API + Cognito + WAF
-│                              # + dashboard + DAX/VPC (DAX NOT deployed by default)
-├─ template-globaltable.yaml   # Deployed template: same as above WITHOUT DAX/VPC
+├─ template.yaml               # The SAM template: global table + API + Cognito
+│                              # + WAF + dashboard + DAX/VPC + direct DDB read
 ├─ samconfig.toml              # SAM deploy defaults (generated)
 ├─ src/
 │  ├─ save-order/
@@ -87,14 +86,16 @@ serverless-application/
 
 ---
 
-## 4. The two templates (important)
+## 4. The template
 
-There are **two** SAM templates. Pick the right one:
+`template.yaml` is the single SAM template and implements all features: the
+DynamoDB global table, the write Lambda, the REST API (POST + direct-DynamoDB
+GET), Cognito auth, WAF, the CloudWatch dashboard, X-Ray tracing, and the DAX
+cluster + VPC with stage caching.
 
-- **`template-globaltable.yaml`** — this is what is **currently deployed**. It has everything except DAX/VPC. Use this for normal deploys. It avoids the ongoing cost of a DAX cluster.
-- **`template.yaml`** — the full reference template. It additionally contains the DAX cluster, a VPC, and a DAX-backed read Lambda (`GET /dax-orders/{orderId}`). Deploying this provisions a VPC and a DAX node (extra cost + ~10 min create). Only use it if you specifically want DAX.
-
-> If you only want the multi-region Orders API, use `template-globaltable.yaml`.
+> Note: the DAX cluster and VPC make the stack slower to deploy (the DAX node
+> can take ~10 minutes to create) and add ongoing cost. That is expected — DAX
+> is part of the required feature set.
 
 ---
 
@@ -147,7 +148,7 @@ The cleaner long-term fix is to disable SSL scanning (or exclude `*.amazonaws.co
 `sam build` packages the Lambda code. Always run it before deploy; `sam deploy` does **not** auto-rebuild.
 
 ```powershell
-sam build --template-file template-globaltable.yaml
+sam build
 ```
 
 ### Step 2 — deploy
@@ -155,7 +156,7 @@ sam build --template-file template-globaltable.yaml
 First time, use guided mode to save defaults:
 
 ```powershell
-sam deploy --guided --template-file template-globaltable.yaml
+sam deploy --guided
 ```
 
 Answer the prompts:
@@ -172,7 +173,7 @@ Answer the prompts:
 After the first run, subsequent deploys are just:
 
 ```powershell
-sam build --template-file template-globaltable.yaml
+sam build
 sam deploy
 ```
 
@@ -267,7 +268,7 @@ The item should appear in `us-west-2` within a few seconds.
 `.github/workflows/deploy.yml` builds and deploys on every push to `main`. It
 authenticates to AWS using **GitHub OIDC** — short-lived credentials from an
 assumed IAM role, with **no long-lived access keys stored** in the repo. The
-workflow builds and deploys `template-globaltable.yaml` (the DAX-free version).
+workflow builds and deploys `template.yaml`.
 
 ### How OIDC auth works here
 
@@ -350,10 +351,6 @@ aws cloudtrail lookup-events `
 The `userName`/`principalId` in the event is the `sub` claim — update the trust
 policy to match it.
 
-> **Switching CI to deploy DAX too:** the workflow builds
-> `template-globaltable.yaml`. To deploy the full stack with DAX/VPC, change the
-> `sam build -t ...` step to use `template.yaml` (slower, extra cost).
-
 ---
 
 ## 11. Cleanup
@@ -371,7 +368,7 @@ aws cloudformation wait stack-delete-complete --stack-name serverless-applicatio
 
 ## 12. Known caveats
 
-- **Two templates:** `template-globaltable.yaml` is deployed; `template.yaml` adds DAX/VPC (extra cost, not deployed by default).
+- **DAX adds deploy time and cost:** the DAX cluster + VPC in `template.yaml` make the stack slower to create (~10 min for the DAX node) and incur ongoing cost. This is expected — DAX is a required feature.
 - **DAX requires a VPC** and is only reachable from in-VPC compute — it cannot be used by the direct API Gateway → DynamoDB read integration.
 - **`amazon-dax-client`** is a dependency (not in the Lambda runtime), so the DAX function needs `npm install` during build — which triggers the SSL note above on affected machines.
 - **Global table conversion is destructive in place:** `AWS::DynamoDB::GlobalTable` is a different resource type from `AWS::DynamoDB::Table`. Converting an existing table required recreating the stack. Plan a migration (export/restore or `update-table` add-replica) if you have production data.
