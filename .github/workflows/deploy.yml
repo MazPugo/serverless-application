@@ -1,0 +1,66 @@
+name: Deploy Serverless Application
+
+# Deploys the SAM application (template + Lambda code) on every push to main.
+on:
+  push:
+    branches:
+      - main
+  # Allow manual runs from the Actions tab as well.
+  workflow_dispatch:
+
+# Avoid overlapping deployments if multiple pushes land quickly.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: serverless-application
+  SAM_CLI_TELEMETRY: 0
+
+jobs:
+  deploy:
+    name: Build and deploy with SAM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Python (required by AWS SAM CLI)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate SAM template
+        run: sam validate --lint
+
+      - name: SAM build (packages Lambda function code)
+        run: sam build
+
+      - name: SAM deploy (updates stack and Lambda code)
+        run: >
+          sam deploy
+          --stack-name "$STACK_NAME"
+          --region "$AWS_REGION"
+          --capabilities CAPABILITY_IAM
+          --resolve-s3
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset
