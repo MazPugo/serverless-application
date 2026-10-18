@@ -2,7 +2,7 @@
 
 A serverless "Orders" application built with the **AWS Serverless Application Model (SAM)**. It stores orders in DynamoDB, exposes a REST API through API Gateway, secures it with Cognito, protects it with WAF, and is observable through CloudWatch and X-Ray. The DynamoDB table is a multi-region **global table** for disaster recovery.
 
-This README is written as a **step-by-step guide**. Follow it top to bottom to understand what each piece does, how it fits together, and how to deploy and test it.
+This Readme is written as a **step-by-step guide**. Follow it top to bottom to understand what each piece does, how it fits together, and how to deploy and test it.
 
 ---
 
