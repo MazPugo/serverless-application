@@ -1,0 +1,30 @@
+# AWS SAM build artifacts
+.aws-sam/
+
+# SAM / CloudFormation packaged output
+packaged.yaml
+samconfig.toml
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Environment / secrets
+.env
+.env.*
+aws-ca-bundle.pem
+
+# Logs
+*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temp files
+_*.txt
+_*.json
+*.tmp
